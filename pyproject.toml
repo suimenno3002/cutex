@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cutex"
+version = "0.1.0"
+description = "A small CuTeDSL operator lab for repeatable Modal GPU experiments"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "modal[api-proxy-support]==1.5.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.1.1",
+]
+remote = [
+    "nvidia-cutlass-dsl[cu13]==4.7.0; platform_system == 'Linux'",
+    "torch==2.13.0; platform_system == 'Linux'",
+]
+
+[tool.setuptools.packages.find]
+include = ["cutex", "cutex.*"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]

@@ -1,0 +1,27 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# Local experiment outputs. The remote copy is kept in a Modal Volume.
+artifacts/*
+!artifacts/.gitkeep
+
+# Credentials and local environment files must never be committed.
+.env
+.env.*
+.modal.toml
+
+# CuTe DSL compiler dumps can be very large.
+*.cubin
+*.ptx
+*.sass
+*.mlir
+*.trace.json
+
