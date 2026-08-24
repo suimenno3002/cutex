@@ -223,6 +223,30 @@ def dense_gemm_v2(
         sfb_ptr, blockscaled_utils.tile_atom_to_shape_SF(b.shape, SF_VECTOR_SIZE)
     )
 
+    # Python print 在 CuTe DSL 的 meta/编译阶段执行，只打印静态 layout，
+    # 不会生成设备端 printf，也不会让 256 个 CUDA threads 重复输出。
+    print("[dense_gemm_v2] sfa.layout =", sfa.layout)
+    print("[dense_gemm_v2] sfb.layout =", sfb.layout)
+
+    # sf_atom = cute.make_layout(
+    #      M 维度     K 维度
+    #     ((32, 4), (SF_VECTOR_SIZE, 4)),
+    #     stride=((16, 4), (0, 1)),
+    # )
+    # Swizzle32x4x4 是 NVIDIA Blackwell tcgen05.mma 的硬件输入格式要求
+    # sfa = cute.make_tensor(
+    #     sfa_ptr, cute.tile_to_shape(sf_atom, a.shape, (2, 1, 3))
+    # )
+    # sfb = cute.make_tensor(
+    #     sfb_ptr, cute.tile_to_shape(sf_atom, b.shape, (2, 1, 3))
+    # )
+    #
+    # 当前 M=N=K=16384、SF_VECTOR_SIZE=32 时，sfa.layout 与 sfb.layout 均为：
+    #   shape  = (((32, 4), 128), ((32, 4), 128), 1)
+    #   stride = (((16, 4), 65536), ((0, 1), 512), 8388608)
+    # 其中 K-rest 的 stride=512，M/N-rest 的 stride=512*128=65536；
+    # 最后一维 stride=65536*128=8388608，正好等于唯一 scale 元素总数。
+
     # 定义 smem 上的 layout
     s_layout_a = cute.make_layout(
         (TILE[0], TILE[2], TMA_STAGES),
@@ -238,6 +262,30 @@ def dense_gemm_v2(
     s_layout_sfb = blockscaled_utils.make_smem_layout_sf(
         SCALE_TILE, SF_VECTOR_SIZE, TMA_STAGES
     )
+
+    print("[dense_gemm_v2] s_layout_sfa =", s_layout_sfa)
+    print("[dense_gemm_v2] s_layout_sfb =", s_layout_sfb)
+
+    # 上述 helper 的等价手写展开如下：
+    # 一个 scale-factor atom 逻辑上覆盖 128 x 128 个 A/B 元素。K 内每
+    # SF_VECTOR_SIZE=32 个元素共享一个 scale，所以对应子 mode 使用 zero stride；
+    # 每个 atom 实际只占 128 x 4 = 512 个 SF8 元素。
+    #
+    # sf_atom = cute.make_layout(
+    #     ((32, 4), (SF_VECTOR_SIZE, 4)),
+    #     stride=((16, 4), (0, 1)),
+    # )
+    # sf_tile_layout = cute.tile_to_shape(sf_atom, SCALE_TILE, (2, 1))
+    # sf_stage_layout = cute.make_layout(
+    #     TMA_STAGES,
+    #     stride=cute.cosize(cute.filter_zeros(sf_tile_layout)),
+    # )
+    # s_layout_sfa = cute.append(sf_tile_layout, sf_stage_layout)
+    # s_layout_sfb = cute.append(sf_tile_layout, sf_stage_layout)
+    #
+    # 当前常量下二者均为：
+    #   shape  = ((32, 4), (32, 4), 1)
+    #   stride = ((16, 4), (0, 1), 512)
 
     # TMA 构造关系：
     #   TMA Op + GMEM tensor + 单 stage SMEM layout + CTA tiler
