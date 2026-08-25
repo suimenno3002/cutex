@@ -56,7 +56,9 @@ def _run_vector_add(m: int, n: int, copy_bits: int) -> dict:
     }
 
 
-def _run_dense_gemm(m: int, n: int, k: int) -> dict:
+def _run_dense_gemm(
+    m: int, n: int, k: int, implementation: str = "tensor_core"
+) -> dict:
     import cutlass
     import cutlass.cute as cute
     import torch
@@ -65,8 +67,16 @@ def _run_dense_gemm(m: int, n: int, k: int) -> dict:
     from cuda.bindings import driver as cuda
     from cutlass.cute.runtime import make_ptr
 
-    from cutex.kernels.dense_gemm import dense_gemm
     from cutex.kernels.dense_gemm_contract import validate_dense_gemm_shape
+
+    if implementation == "tensor_core":
+        from cutex.kernels.dense_gemm import dense_gemm as kernel_fn
+    elif implementation == "manual_pipeline_v9":
+        from cutex.kernels.dense_gemm_v9 import dense_gemm_v9 as kernel_fn
+    else:
+        raise ValueError(
+            "implementation must be 'tensor_core' or 'manual_pipeline_v9'"
+        )
 
     _require_supported_gpu(torch)
     m, n, k = validate_dense_gemm_shape(m, n, k)
@@ -114,12 +124,17 @@ def _run_dense_gemm(m: int, n: int, k: int) -> dict:
     torch_stream = torch.cuda.current_stream()
     cuda_stream = cuda.CUstream(torch_stream.cuda_stream)
     compiled = cute.compile(
-        dense_gemm, a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr, cuda_stream
+        kernel_fn, a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr, cuda_stream
     )
     compiled(a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr, cuda_stream)
     torch.cuda.synchronize()
     return {
-        "kernel": "dense_gemm",
+        "kernel": (
+            "dense_gemm_v9"
+            if implementation == "manual_pipeline_v9"
+            else "dense_gemm"
+        ),
+        "implementation": implementation,
         "shape": {"m": m, "n": n, "k": k},
         "precision": "rowwise MXFP8 E4M3/E8M0, FP32 accumulate, BF16 output",
         "launches": 1,
@@ -139,12 +154,19 @@ def main(argv: list[str] | None = None) -> int:
     gemm.add_argument("--m", type=int, required=True)
     gemm.add_argument("--n", type=int, required=True)
     gemm.add_argument("--k", type=int, required=True)
+    gemm.add_argument(
+        "--implementation",
+        choices=("tensor_core", "manual_pipeline_v9"),
+        default="tensor_core",
+    )
 
     args = parser.parse_args(argv)
     if args.kernel == "vector-add":
         result = _run_vector_add(args.m, args.n, args.copy_bits)
     else:
-        result = _run_dense_gemm(args.m, args.n, args.k)
+        result = _run_dense_gemm(
+            args.m, args.n, args.k, implementation=args.implementation
+        )
     print(json.dumps({"status": "PASS", **result}, sort_keys=True))
     return 0
 

@@ -126,13 +126,34 @@ def run_dense_gemm_remote(
             "threads_per_cta": V1_THREADS,
             "ab_stages": 1,
         }
-        if trace:
-            raise ValueError("IKET worker is not yet wired for cuda_core_v1")
+    elif implementation == "manual_pipeline_v9":
+        from cutex.kernels.dense_gemm_v9 import (
+            AB_STAGES as V9_AB_STAGES,
+            CLUSTER_SHAPE as V9_CLUSTER_SHAPE,
+            MMA_INSTRUCTION as V9_MMA_INSTRUCTION,
+            MMA_TILE as V9_MMA_TILE,
+            THREADS as V9_THREADS,
+            dense_gemm_v9 as kernel_fn,
+        )
+
+        kernel_name = f"{KERNEL_BASE_NAME}_manual_pipeline_v9"
+        kernel_config = {
+            "implementation": implementation,
+            "arithmetic": "SM103 2CTA tcgen05 block-scaled tensor core",
+            "mma_instruction": list(V9_MMA_INSTRUCTION),
+            "tile": list(V9_MMA_TILE),
+            "threads_per_cta": V9_THREADS,
+            "cluster": list(V9_CLUSTER_SHAPE),
+            "ab_stages": V9_AB_STAGES,
+            "synchronization": "manual TMA-UMMA and UMMA-epilogue mbarriers",
+        }
     else:
         raise ValueError(
             "implementation must be 'tensor_core', 'tma_cuda_core_v2', "
-            "or 'cuda_core_v1'"
+            "'cuda_core_v1', or 'manual_pipeline_v9'"
         )
+    if trace and implementation not in {"tensor_core", "manual_pipeline_v9"}:
+        raise ValueError(f"IKET worker is not wired for {implementation}")
     if warmup < 0 or iterations < 1 or gpu_warmup_seconds < 0:
         raise ValueError(
             "warmup must be >= 0, iterations must be >= 1, and GPU warmup must be >= 0"
@@ -311,9 +332,26 @@ def run_dense_gemm_remote(
     flop_count = dense_gemm_flops(m, n, k)
     trace_metadata = disabled_iket_metadata()
     if trace:
+        trace_cluster = (
+            (32, 32, 0) if implementation == "manual_pipeline_v9" else None
+        )
         iket_result = run_iket_profile(
             remote_run_dir / "iket",
-            ["dense-gemm", "--m", str(m), "--n", str(n), "--k", str(k)],
+            [
+                "dense-gemm",
+                "--m",
+                str(m),
+                "--n",
+                str(n),
+                "--k",
+                str(k),
+                "--implementation",
+                implementation,
+            ],
+            instrumented_cluster=trace_cluster,
+            max_ts_cnt_per_warp=(
+                2048 if implementation == "manual_pipeline_v9" else None
+            ),
         )
         trace_metadata = iket_result.to_metadata(volume_root=CACHE_MOUNT)
         trace_metadata["workload_shape"] = {"m": m, "n": n, "k": k}

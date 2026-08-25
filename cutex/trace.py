@@ -21,6 +21,8 @@ class IketTraceResult:
     command: tuple[str, ...]
     returncode: int
     artifacts: tuple[Path, ...]
+    instrumented_cluster: tuple[int, int, int] | None = None
+    max_ts_cnt_per_warp: int | None = None
 
     def to_metadata(self, *, volume_root: str | Path) -> dict[str, Any]:
         root = Path(volume_root)
@@ -40,8 +42,17 @@ class IketTraceResult:
             "enabled": True,
             "instrumentation": "in_kernel",
             "benchmark_instrumented": False,
-            "enabled_cluster": None,
-            "capture_scope": "all_ctas",
+            "enabled_cluster": (
+                list(self.instrumented_cluster)
+                if self.instrumented_cluster is not None
+                else None
+            ),
+            "capture_scope": (
+                "single_cluster_in_kernel"
+                if self.instrumented_cluster is not None
+                else "all_ctas"
+            ),
+            "max_ts_cnt_per_warp": self.max_ts_cnt_per_warp,
             "files": files,
         }
 
@@ -52,20 +63,24 @@ def build_run_iket_command(
     *,
     postprocess: str = "all",
     python_executable: str | None = None,
+    max_ts_cnt_per_warp: int | None = None,
 ) -> list[str]:
     """Build the standalone profiler command used inside the Modal container."""
 
     if postprocess not in {"all", "perfetto", "json"}:
         raise ValueError("postprocess must be one of: all, perfetto, json")
+    if max_ts_cnt_per_warp is not None and max_ts_cnt_per_warp < 1:
+        raise ValueError("max_ts_cnt_per_warp must be positive")
     command = [
         "run-iket",
         "--output-dir",
         str(Path(output_dir)),
         "--clobber",
         "profile",
-        "--postprocess",
-        postprocess,
     ]
+    if max_ts_cnt_per_warp is not None:
+        command.extend(["--max-ts-cnt-per-warp", str(max_ts_cnt_per_warp)])
+    command.extend(["--postprocess", postprocess])
     command.extend(
         [
             "--",
@@ -83,6 +98,8 @@ def run_iket_profile(
     workload_args: Sequence[str],
     *,
     timeout_seconds: float = 10 * 60,
+    instrumented_cluster: tuple[int, int, int] | None = None,
+    max_ts_cnt_per_warp: int | None = None,
 ) -> IketTraceResult:
     """Run one deterministic, single-launch workload under CUTLASS IKET."""
 
@@ -90,6 +107,7 @@ def run_iket_profile(
     command = build_run_iket_command(
         destination,
         workload_args,
+        max_ts_cnt_per_warp=max_ts_cnt_per_warp,
     )
     try:
         completed = subprocess.run(
@@ -152,6 +170,8 @@ def run_iket_profile(
         command=tuple(command),
         returncode=completed.returncode,
         artifacts=artifacts,
+        instrumented_cluster=instrumented_cluster,
+        max_ts_cnt_per_warp=max_ts_cnt_per_warp,
     )
 
 
@@ -185,6 +205,7 @@ def disabled_iket_metadata() -> dict[str, Any]:
         "benchmark_instrumented": False,
         "enabled_cluster": None,
         "capture_scope": None,
+        "max_ts_cnt_per_warp": None,
         "files": [],
     }
 

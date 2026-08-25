@@ -31,6 +31,36 @@ def test_build_run_iket_command_profiles_one_worker_process(tmp_path):
     ]
 
 
+def test_build_run_iket_command_can_reserve_event_buffer(tmp_path):
+    command = build_run_iket_command(
+        tmp_path / "iket",
+        ["dense-gemm", "--implementation", "manual_pipeline_v9"],
+        max_ts_cnt_per_warp=2048,
+    )
+
+    profile = command.index("profile")
+    separator = command.index("--")
+    assert command[profile + 1 : separator] == [
+        "--max-ts-cnt-per-warp",
+        "2048",
+        "--postprocess",
+        "all",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"max_ts_cnt_per_warp": 0}, "must be positive"),
+    ],
+)
+def test_build_run_iket_command_validates_sampling_options(
+    tmp_path, kwargs, message
+):
+    with pytest.raises(ValueError, match=message):
+        build_run_iket_command(tmp_path / "iket", ["dense-gemm"], **kwargs)
+
+
 def test_run_iket_profile_requires_perfetto_and_json(monkeypatch, tmp_path):
     output_dir = tmp_path / "iket"
 
@@ -41,11 +71,19 @@ def test_run_iket_profile_requires_perfetto_and_json(monkeypatch, tmp_path):
         return subprocess.CompletedProcess(command, 0, "worker ok", "")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    result = run_iket_profile(output_dir, ["dense-gemm"])
+    result = run_iket_profile(
+        output_dir,
+        ["dense-gemm"],
+        instrumented_cluster=(32, 32, 0),
+        max_ts_cnt_per_warp=2048,
+    )
     metadata = result.to_metadata(volume_root=tmp_path)
 
     assert metadata["backend"] == "cutlass_iket"
     assert metadata["benchmark_instrumented"] is False
+    assert metadata["enabled_cluster"] == [32, 32, 0]
+    assert metadata["capture_scope"] == "single_cluster_in_kernel"
+    assert metadata["max_ts_cnt_per_warp"] == 2048
     assert {item["kind"] for item in metadata["files"]} == {
         "perfetto",
         "json",
