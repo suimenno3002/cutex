@@ -73,9 +73,14 @@ def _run_dense_gemm(
         from cutex.kernels.dense_gemm import dense_gemm as kernel_fn
     elif implementation == "manual_pipeline_v9":
         from cutex.kernels.dense_gemm_v9 import dense_gemm_v9 as kernel_fn
+    elif implementation == "manual_pipeline_v10":
+        from cutex.kernels.dense_gemm_v10 import dense_gemm_v10 as kernel_fn
+    elif implementation == "manual_pipeline_v11":
+        from cutex.kernels.dense_gemm_v11 import dense_gemm_v11 as kernel_fn
     else:
         raise ValueError(
-            "implementation must be 'tensor_core' or 'manual_pipeline_v9'"
+            "implementation must be 'tensor_core', 'manual_pipeline_v9', "
+            "'manual_pipeline_v10', or 'manual_pipeline_v11'"
         )
 
     _require_supported_gpu(torch)
@@ -129,11 +134,12 @@ def _run_dense_gemm(
     compiled(a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr, cuda_stream)
     torch.cuda.synchronize()
     return {
-        "kernel": (
-            "dense_gemm_v9"
-            if implementation == "manual_pipeline_v9"
-            else "dense_gemm"
-        ),
+        "kernel": {
+            "tensor_core": "dense_gemm",
+            "manual_pipeline_v9": "dense_gemm_v9",
+            "manual_pipeline_v10": "dense_gemm_v10",
+            "manual_pipeline_v11": "dense_gemm_v11",
+        }[implementation],
         "implementation": implementation,
         "shape": {"m": m, "n": n, "k": k},
         "precision": "rowwise MXFP8 E4M3/E8M0, FP32 accumulate, BF16 output",
@@ -156,7 +162,12 @@ def main(argv: list[str] | None = None) -> int:
     gemm.add_argument("--k", type=int, required=True)
     gemm.add_argument(
         "--implementation",
-        choices=("tensor_core", "manual_pipeline_v9"),
+        choices=(
+            "tensor_core",
+            "manual_pipeline_v9",
+            "manual_pipeline_v10",
+            "manual_pipeline_v11",
+        ),
         default="tensor_core",
     )
 

@@ -6,8 +6,8 @@
 
 ## 验证边界
 
-- 当前可运行路径包括默认 `tensor_core` 和手写调度的 `manual_pipeline_v9`；默认实现仍是稳定主路径，v9 用于 2SM pipeline 分析和性能实验。
-- `manual_pipeline_v9` 已在 B300/SM103 上完成编译、正确性、未插桩性能和单 cluster IKET 验证；当前源码为四级 A/B/scale ring。
+- 当前可运行路径包括默认 `tensor_core` 和手写调度的 `manual_pipeline_v9/v10/v11`；默认实现仍是稳定主路径，后三者用于 2SM pipeline 对照和性能实验。
+- v9 保留四级 ring 与行主序 grid；v10 是六级 ring 加 Morton swizzle；v11 冻结六级流水，只改用 CuTe layout 的 `8×8` cluster block swizzle。
 - `tma_cuda_core_v2` 曾完成过一次 16384³ smoke test；2026-08-24 最近一次含 layout 日志的复测在首个 kernel launch 后长期占满 GPU，未返回正确性或计时结果。当前应把它视为待排查回归，而不是稳定入口。
 - 本地测试或 JIT 编译日志不等于 B300 成功。只有远端结果同时给出 B300/SM103、`status: PASS`、正确性数据和非零计时，才算端到端跑通。
 
@@ -180,7 +180,9 @@ Windows PowerShell 也可使用仓库脚本：
 | `tensor_core` | SM103 block-scaled Tensor Core 主实现 | 推荐；B300 历史正确性和性能基线已存在 |
 | `cuda_core_v1` | 手工反量化和标量 CUDA Core 教学对照 | B300 历史正确性已通过；约 2.35 秒/发，不用于性能目标 |
 | `tma_cuda_core_v2` | 手写 TMA + mbarrier 教学对照 | 有历史单次 PASS，但最近回归挂起；先排查再重跑 |
-| `manual_pipeline_v9` | 2SM、手写 mbarrier、warp-specialized Tensor Core 实现 | 已接入入口并通过 B300 正确性/性能；当前四级 ring，非 persistent |
+| `manual_pipeline_v9` | 原始 2SM、手写 mbarrier、warp-specialized Tensor Core 实现 | 四级 ring + 行主序 grid，非 persistent |
+| `manual_pipeline_v10` | 从修改后 v9 独立出的后继实现 | 六级 ring + Z-order cluster tile，非 persistent |
+| `manual_pipeline_v11` | CuTe layout thread-block swizzle 对照 | 六级 ring + `8×8` cluster block swizzle，非 persistent |
 
 如需复核 v1，只使用最小口径：
 
@@ -222,7 +224,7 @@ uv run modal volume get cutex-autotune-cache \
 
 - `--dump-ir` 将 CuTeDSL dump/PTX 保存在该次远端 run 目录的 `cute-dsl-dump/`，需要通过 Volume 取回。
 - `--trace` 会在普通 benchmark 完成后额外运行一次完整 16384³ IKET 采集，成本和产物都更大；第一次 smoke 和普通 TFLOPS 测试不要启用。
-- `cutex/iket_worker.py` 会按 `--implementation` 选择 `tensor_core` 或 `manual_pipeline_v9`。v9 trace 只由中部 cluster `(32,32,0)` 写用户 ranges，并把每 warp event buffer 提高到 2048；v1/v2 仍不支持 `--trace`。
+- `cutex/iket_worker.py` 会按 `--implementation` 选择 `tensor_core` 或 `manual_pipeline_v9/v10/v11`。v9-v11 的 trace 由中部 cluster `(32,32,0)` 写 ranges，三者都把每 warp event buffer 提高到 2048；v1/v2 仍不支持 `--trace`。
 
 ## 9. 观察和停止异常任务
 

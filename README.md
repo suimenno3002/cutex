@@ -27,7 +27,9 @@ cutex/
 │       ├── dense_gemm_v0.py # 同一精度合同下的空白实现骨架
 │       ├── dense_gemm_v1.py # 手工反量化、CUDA Core 分块 GEMM
 │       ├── dense_gemm_v2.py # 手写 mbarrier 的单级 TMA + CUDA Core GEMM
-│       ├── dense_gemm_v9.py # 非 persistent 的 2SM + 手写 warp-specialized pipeline
+│       ├── dense_gemm_v9.py # 原始四级 ring 的非 persistent 2SM pipeline
+│       ├── dense_gemm_v10.py # 六级 ring + Z-order 的 v9 后继版本
+│       ├── dense_gemm_v11.py # 六级 ring + CuTe 8×8 cluster block swizzle
 │       └── dense_gemm_contract.py # shape、精度与 scale 布局合同
 ├── modal_app.py             # Modal image、GPU function、本地入口
 ├── modal_dense_gemm.py      # 固定 B300 MXFP8 GEMM 验证与 benchmark 入口
@@ -168,7 +170,7 @@ MMA: FP8 E4M3FN × E4M3FN，单一 FP32 TMEM accumulator
 
 正式 kernel 只接受 `M=N=K=16384`，固定使用 `128 × 256 × 128` CTA tile、四级 A/B/scale TMA pipeline、SM103 `tcgen05` block-scaled MMA 和 128 threads。量化与 scale swizzle 在计时区外；没有 fast accumulation 或 split-K。`dense_gemm_v0.py` 保留同一 pointer 接口的纯 TODO 骨架；`dense_gemm_v1.py` 实现 16 × 16 × 16 shared-memory 分块、手工 MXFP8 反量化和标量 FP32 CUDA Core 累加；`dense_gemm_v2.py` 则按 K tile 严格串行执行四路 TMA、手写 mbarrier 等待、标量 FP32 CUDA Core 累加与 BF16 写回，不创建 `PipelineTmaAsync`、MMA 或 Tensor Core 对象。v1/v2 都用于教学与正确性对照，不以性能为目标。
 
-`dense_gemm_v9.py` 是可运行的手写异步流水实现：固定 `CtaGroup.TWO`、`(2,1,1)` cluster、pair-wide `256 × 256 × 128` tile、当前四级 A/B/scale 环形缓冲和 `4 epilogue + 1 MMA + 1 TMA` warp 特化；常规 grid 中每对 CTA 只处理一个输出 tile，因此没有 persistent tile scheduler。device 侧直接使用 full/empty `mbarrier` 调度四路 TMA、2-CTA `tcgen05` MMA、TMEM 到寄存器的 BF16 epilogue，不依赖 `PipelineTmaUmma` 或 `PipelineUmmaAsync`。它已作为 `--implementation manual_pipeline_v9` 接入 `modal_dense_gemm.py`，并支持只对一个中部 cluster 写入细粒度 IKET ranges。
+`dense_gemm_v9.py` 保留原始手写异步流水实现：固定 `CtaGroup.TWO`、`(2,1,1)` cluster、pair-wide `256 × 256 × 128` tile、四级 A/B/scale 环形缓冲、常规行主序 grid 和 `4 epilogue + 1 MMA + 1 TMA` warp 特化。`dense_gemm_v10.py` 从此前工作区中修改后的 v9 独立出来，在其余计算与同步路径不变的前提下使用六级 ring，并以 Z-order（Morton）重映射 cluster tile。`dense_gemm_v11.py` 冻结 v10 的流水参数，只把 Morton 解码替换为 CuTe layout 表达的 `8×8` cluster block swizzle，仍是 non-persistent。三个版本分别通过 `manual_pipeline_v9/v10/v11` 选择，也都支持单 cluster IKET ranges。
 
 ```powershell
 uv run modal run modal_dense_gemm.py --m 16384 --n 16384 --k 16384 `

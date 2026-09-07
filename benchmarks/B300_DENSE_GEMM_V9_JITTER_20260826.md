@@ -19,6 +19,11 @@
 > `AB_STAGES=4`，并完成一次未插桩 B300 复测。本文原有细粒度数值来自 AB6
 > profile，并同时引用 AB5/AB6 对比结果；它们是历史测量事实，不随当前常量回写。
 
+> 状态更新（2026-08-26）：加入 cluster 级 Z-order 栅格化后，`mma_wait_ab_full`
+> 抖动的直接主因从“交接 burst”进一步定位到“hbm 带宽近饱和下的完成延迟方差”。
+> Z-order 把波长从 64×2 变为约 16×10，AB6 同口径下 wait 总量 -29.7%、长尾 -47%、
+> 未插桩单样本 custom/TE 从 76.44% 升至 98.39%。见第六节。
+
 ## 当前配置与测量口径
 
 - GPU：NVIDIA B300 SXM6 AC，SM103，148 SM。
@@ -199,11 +204,16 @@ AB6 相对 AB5 的差值与上述运行间波动处在同一量级，因此目�
 4. `ACC_STAGES=1` 使 5.120 us accumulator/epilogue tail 位于 tile 的关键路径。
 5. 一 CTA/SM、2-SM cluster 和约 56 waves 的执行模型放大了每 tile 的等待与尾部。
 6. 未插桩延迟存在明显的 sample 内和 run 间波动。
+7. **动态定位到主因（2026-08-26 Z-order 节）**：行主序发射下，每波是
+   全 M 列 × 1–2 N 列的瘦长足迹，把 A/B 面板反复重读，使 whole-launch 读出约
+   15 GB、等效约 65% HBM 带宽，把 TMA 完成延迟放大到 1.2–2.6 us、且呈随机；
+   换用 Z-order 栅格化后波长变为约 16 × 10，读出降为约 6.6 GB，`mma_wait_ab_full`
+   总量从 20.256 us 降到 14.240 us（AB6 口径，`-29.7%`）。
 
 ### 尚未确认
 
-1. 某一次 `mma_wait_ab_full` 的直接原因究竟是 HBM、L2 miss、TMA engine 排队、
-   scale transaction，还是 warp issue 时序。
+1. Z-order 后剩余 wait 长尾的直接原因仍含 HBM/L2 miss 与 TMA engine 排队两种可能；
+   需要 counter-based profile 区分。
 2. TMA、Tensor Core、L2、HBM 的实际利用率和 backpressure counter。
 3. 50 个 benchmark sample 的时间顺序，以及对应的 power、clock、temperature。
 4. cuBLASLt 本次选中 kernel 的 tile、cluster、stage、persistent 和 epilogue 策略。
@@ -232,7 +242,57 @@ AB6 相对 AB5 的差值与上述运行间波动处在同一量级，因此目�
 4. 对 TE 单次 launch 读取 cuBLASLt algorithm metadata 和 grid/block/cluster 信息，
    用于区分算法工作划分差异与单纯 power/clock 差异。
 
-## 六、问题关闭标准
+## 六、Z-order 栅格化修复（2026-08-26）
+
+针对 1.2 节确认的“交接呈 burst”现象，2026-08-26 在 `dense_gemm_v9.py` 中加入
+cluster 级 Z-order（Morton）栅格化：kernel 仍读物理 `block_idx`，但把
+`cluster_linear`（行主序 cid）经 `_zorder_decode` 解码成 64 × 64 cluster tile 网格上的
+tile 坐标，供 TMA 切片和 mma 切片使用。grid、`(2,1,1)` cluster、tile、
+warp 角色和 full/empty mbarrier 协议均不变；同一 cluster 的两 CTA 共享同一个
+cid，因此配对与 `mma_tile_coord_v` 语义不变。
+
+### 机制
+
+行主序发射下，任意约 74-cluster 波都是“全 M × 1–2 N”的瘦长足迹，把 A/B 面板
+反复重读。以 `warpLifetimes` 重建的 AB6 基线波中位单元为 277 MB、whole-launch
+15.25 GB；Z-order 让连续 cid 在 tile 空间聚成约 16 × 10 的方形波，波中位 119 MB、
+whole-launch 6.57 GB（约 2.3×）。HBM 压力下降后 TMA 完成延迟的均值与方差都减小，
+`mma_wait_ab_full` 因而收敛。
+
+### AB6 同口径对比（唯一变量 = 栅格化）
+
+| 指标 | AB6 线性（基线） | AB6+Zorder | 变化 |
+|---|---:|---:|---:|
+| `mma_wait_ab_full` 总量 | 20.256 us | **14.240 us** | **-29.7%** |
+| `mma_wait_ab_full` excess | 12.064 us | **6.016 us** | **-50.1%** |
+| >128ns 长尾次数 | 38 / 128 | **20 / 128** | **-47%** |
+| wait p95 | 448 ns | **192 ns** | **-57%** |
+| wait max | 800 ns | 992 ns | +24%（长尾右移已由稀疏化抵消） |
+| TMA 完成延迟 p50 | 1984 ns | **1168 ns** | **-41%** |
+| TMA 完成延迟 max | 2624 ns | **1632 ns** | **-38%** |
+| 未插桩单样本 custom / TE | 76.44% | **98.39%** | **+22 pp** |
+
+> 单样本输入为 0 warmup / 1 iteration，绝对 μs 只用于同轮对照；IKET 为单独 launch。
+
+### AB4+Zorder 对照
+
+同为 Z-order、改为 `AB_STAGES=4` 时，`mma_wait_ab_full` 总量为 20.032 us、
+长尾 55/128。四段 ring 比六段更紧，把剩余 1 µs 级完成延迟暴露为更多短 wait；
+因此保留 `AB_STAGES=6` 才是更优组合。
+
+### 未插桩性能
+
+| 运行 | custom median | TE median | custom / TE | 备注 |
+|---|---:|---:|---:|---|
+| AB6 线性基线 | 4250.352 us | 3249.008 us | 76.44% | 50-sample |
+| AB4+Zorder | 2976.032 us | 2779.264 us | 93.05% | 单样本 |
+| AB6+Zorder | 2783.040 us | 2707.008 us | 98.39% | 单样本 |
+
+端到端提升的一部分来自功耗/时钟状态（三次运行不同），但 Z-order 在 IKET 层的
+wait 与 TMA 完成延迟上的下降是机制性的。要把它变成可复现的基准结论，仍需一次
+正式 50-sample 未插桩测量。
+
+## 七、问题关闭标准
 
 只有同时满足以下条件，才认为“抖动问题”已经得到解释：
 
@@ -244,14 +304,14 @@ AB6 相对 AB5 的差值与上述运行间波动处在同一量级，因此目�
 
 ## 原始材料
 
-- 当前源码：`cutex/kernels/dense_gemm_v9.py`
-- 当前结果：
-  `artifacts/20260825T175241.998683Z-dense_gemm_mxfp8_16384_manual_pipeline_v9/result.json`
-- AB4 未插桩复测结果：
-  `artifacts/20260825T183231.159159Z-dense_gemm_mxfp8_16384_manual_pipeline_v9/result.json`
-- 当前唯一 IKET profile：
-  `artifacts/20260825T175241.998683Z-dense_gemm_mxfp8_16384_manual_pipeline_v9/iket/iket_pid_0x10.pftrace`
-- 当前 IKET JSON：
+- 当前源码：`cutex/kernels/dense_gemm_v9.py`（含 Z-order 栅格化，`AB_STAGES=6`）
+- AB6 线性 IKET profile：
   `artifacts/20260825T175241.998683Z-dense_gemm_mxfp8_16384_manual_pipeline_v9/iket/iket_pid_0x10.trace.json`
+- AB6+Zorder IKET profile：
+  `artifacts/20260826T044016.789793Z-dense_gemm_mxfp8_16384_manual_pipeline_v9/iket/iket_pid_0x10.trace.json`
+- AB4+Zorder IKET profile：
+  `artifacts/20260826T042810.954532Z-dense_gemm_mxfp8_16384_manual_pipeline_v9/iket/iket_pid_0x10.trace.json`
 - AB6 对比报告：`benchmarks/B300_DENSE_GEMM_V9_AB6_IKET_COMPARISON_20260826.md`
 - 初始 IKET 分析：`benchmarks/B300_DENSE_GEMM_V9_IKET_PROFILE_20260825.md`
+- 栅格化波足迹估算：`scripts/analyze_iket_v9.py`
+- 机制详解：`benchmarks/B300_DENSE_GEMM_V9_HBM_BANDWIDTH_ZORDER_20260826.md`

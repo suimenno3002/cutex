@@ -145,15 +145,73 @@ def run_dense_gemm_remote(
             "threads_per_cta": V9_THREADS,
             "cluster": list(V9_CLUSTER_SHAPE),
             "ab_stages": V9_AB_STAGES,
+            "rasterization": "row-major cluster tiles",
+            "synchronization": "manual TMA-UMMA and UMMA-epilogue mbarriers",
+        }
+    elif implementation == "manual_pipeline_v10":
+        from cutex.kernels.dense_gemm_v10 import (
+            AB_STAGES as V10_AB_STAGES,
+            CLUSTER_SHAPE as V10_CLUSTER_SHAPE,
+            MMA_INSTRUCTION as V10_MMA_INSTRUCTION,
+            MMA_TILE as V10_MMA_TILE,
+            THREADS as V10_THREADS,
+            dense_gemm_v10 as kernel_fn,
+        )
+
+        kernel_name = f"{KERNEL_BASE_NAME}_manual_pipeline_v10"
+        kernel_config = {
+            "implementation": implementation,
+            "arithmetic": "SM103 2CTA tcgen05 block-scaled tensor core",
+            "mma_instruction": list(V10_MMA_INSTRUCTION),
+            "tile": list(V10_MMA_TILE),
+            "threads_per_cta": V10_THREADS,
+            "cluster": list(V10_CLUSTER_SHAPE),
+            "ab_stages": V10_AB_STAGES,
+            "rasterization": "Z-order (Morton) cluster tiles",
+            "synchronization": "manual TMA-UMMA and UMMA-epilogue mbarriers",
+        }
+    elif implementation == "manual_pipeline_v11":
+        from cutex.kernels.dense_gemm_v11 import (
+            AB_STAGES as V11_AB_STAGES,
+            CLUSTER_SHAPE as V11_CLUSTER_SHAPE,
+            CLUSTER_SWIZZLE_SIZE as V11_CLUSTER_SWIZZLE_SIZE,
+            MMA_INSTRUCTION as V11_MMA_INSTRUCTION,
+            MMA_TILE as V11_MMA_TILE,
+            THREADS as V11_THREADS,
+            dense_gemm_v11 as kernel_fn,
+        )
+
+        kernel_name = f"{KERNEL_BASE_NAME}_manual_pipeline_v11"
+        kernel_config = {
+            "implementation": implementation,
+            "arithmetic": "SM103 2CTA tcgen05 block-scaled tensor core",
+            "mma_instruction": list(V11_MMA_INSTRUCTION),
+            "tile": list(V11_MMA_TILE),
+            "threads_per_cta": V11_THREADS,
+            "cluster": list(V11_CLUSTER_SHAPE),
+            "ab_stages": V11_AB_STAGES,
+            "cluster_swizzle_size": V11_CLUSTER_SWIZZLE_SIZE,
+            "rasterization": "CuTe layout 8x8 cluster block swizzle",
             "synchronization": "manual TMA-UMMA and UMMA-epilogue mbarriers",
         }
     else:
         raise ValueError(
             "implementation must be 'tensor_core', 'tma_cuda_core_v2', "
-            "'cuda_core_v1', or 'manual_pipeline_v9'"
+            "'cuda_core_v1', 'manual_pipeline_v9', 'manual_pipeline_v10', "
+            "or 'manual_pipeline_v11'"
         )
-    if trace and implementation not in {"tensor_core", "manual_pipeline_v9"}:
+    if trace and implementation not in {
+        "tensor_core",
+        "manual_pipeline_v9",
+        "manual_pipeline_v10",
+        "manual_pipeline_v11",
+    }:
         raise ValueError(f"IKET worker is not wired for {implementation}")
+    is_manual_pipeline = implementation in {
+        "manual_pipeline_v9",
+        "manual_pipeline_v10",
+        "manual_pipeline_v11",
+    }
     if warmup < 0 or iterations < 1 or gpu_warmup_seconds < 0:
         raise ValueError(
             "warmup must be >= 0, iterations must be >= 1, and GPU warmup must be >= 0"
@@ -332,9 +390,7 @@ def run_dense_gemm_remote(
     flop_count = dense_gemm_flops(m, n, k)
     trace_metadata = disabled_iket_metadata()
     if trace:
-        trace_cluster = (
-            (32, 32, 0) if implementation == "manual_pipeline_v9" else None
-        )
+        trace_cluster = (32, 32, 0) if is_manual_pipeline else None
         iket_result = run_iket_profile(
             remote_run_dir / "iket",
             [
@@ -349,9 +405,7 @@ def run_dense_gemm_remote(
                 implementation,
             ],
             instrumented_cluster=trace_cluster,
-            max_ts_cnt_per_warp=(
-                2048 if implementation == "manual_pipeline_v9" else None
-            ),
+            max_ts_cnt_per_warp=2048 if is_manual_pipeline else None,
         )
         trace_metadata = iket_result.to_metadata(volume_root=CACHE_MOUNT)
         trace_metadata["workload_shape"] = {"m": m, "n": n, "k": k}
