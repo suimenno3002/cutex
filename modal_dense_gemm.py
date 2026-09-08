@@ -53,6 +53,7 @@ def run_dense_gemm_remote(
 
     import cutlass
     import cutlass.cute as cute
+    import cutlass.utils as cutlass_utils
     import torch
     import transformer_engine
     import transformer_engine.pytorch as te
@@ -194,23 +195,51 @@ def run_dense_gemm_remote(
             "rasterization": "CuTe layout 8x8 cluster block swizzle",
             "synchronization": "manual TMA-UMMA and UMMA-epilogue mbarriers",
         }
+    elif implementation == "manual_pipeline_v12":
+        from cutex.kernels.dense_gemm_v12 import (
+            AB_STAGES as V12_AB_STAGES,
+            ACC_PHYSICAL_STAGES as V12_ACC_PHYSICAL_STAGES,
+            CLUSTER_SHAPE as V12_CLUSTER_SHAPE,
+            CLUSTER_SWIZZLE_SIZE as V12_CLUSTER_SWIZZLE_SIZE,
+            MMA_INSTRUCTION as V12_MMA_INSTRUCTION,
+            MMA_TILE as V12_MMA_TILE,
+            THREADS as V12_THREADS,
+            dense_gemm_v12 as kernel_fn,
+        )
+
+        kernel_name = f"{KERNEL_BASE_NAME}_manual_pipeline_v12"
+        kernel_config = {
+            "implementation": implementation,
+            "arithmetic": "SM103 2CTA tcgen05 block-scaled tensor core",
+            "mma_instruction": list(V12_MMA_INSTRUCTION),
+            "tile": list(V12_MMA_TILE),
+            "threads_per_cta": V12_THREADS,
+            "cluster": list(V12_CLUSTER_SHAPE),
+            "ab_stages": V12_AB_STAGES,
+            "physical_accumulator_views": V12_ACC_PHYSICAL_STAGES,
+            "cluster_swizzle_size": V12_CLUSTER_SWIZZLE_SIZE,
+            "rasterization": "native static persistent 8x8 cluster swizzle",
+            "synchronization": "persistent manual mbarriers with early accumulator release",
+        }
     else:
         raise ValueError(
             "implementation must be 'tensor_core', 'tma_cuda_core_v2', "
             "'cuda_core_v1', 'manual_pipeline_v9', 'manual_pipeline_v10', "
-            "or 'manual_pipeline_v11'"
+            "'manual_pipeline_v11', or 'manual_pipeline_v12'"
         )
     if trace and implementation not in {
         "tensor_core",
         "manual_pipeline_v9",
         "manual_pipeline_v10",
         "manual_pipeline_v11",
+        "manual_pipeline_v12",
     }:
         raise ValueError(f"IKET worker is not wired for {implementation}")
     is_manual_pipeline = implementation in {
         "manual_pipeline_v9",
         "manual_pipeline_v10",
         "manual_pipeline_v11",
+        "manual_pipeline_v12",
     }
     if warmup < 0 or iterations < 1 or gpu_warmup_seconds < 0:
         raise ValueError(
@@ -321,15 +350,48 @@ def run_dense_gemm_remote(
     cuda_stream = cuda.CUstream(torch_stream.cuda_stream)
 
     compile_started = time.perf_counter()
-    compiled = cutex.compile(
-        kernel_fn,
-        x_ptr,
-        weight_ptr,
-        x_scale_ptr,
-        weight_scale_ptr,
-        output_ptr,
-        cuda_stream,
-    )
+    if implementation == "manual_pipeline_v12":
+        max_active_clusters = cutlass_utils.HardwareInfo().get_max_active_clusters(
+            V12_CLUSTER_SHAPE[0] * V12_CLUSTER_SHAPE[1],
+            stream=cuda_stream,
+        )
+        if max_active_clusters < 1:
+            raise RuntimeError("CUDA reported no active 2-CTA clusters")
+        logical_output_clusters = (m // V12_MMA_TILE[0]) * (
+            n // V12_MMA_TILE[1]
+        )
+        kernel_config["max_active_clusters"] = max_active_clusters
+        kernel_config["persistent_grid"] = [
+            V12_CLUSTER_SHAPE[0],
+            V12_CLUSTER_SHAPE[1],
+            max_active_clusters,
+        ]
+        kernel_config["logical_output_clusters"] = logical_output_clusters
+        kernel_config["work_tiles_per_cluster"] = [
+            logical_output_clusters // max_active_clusters,
+            (logical_output_clusters + max_active_clusters - 1)
+            // max_active_clusters,
+        ]
+        compiled = cutex.compile(
+            kernel_fn,
+            x_ptr,
+            weight_ptr,
+            x_scale_ptr,
+            weight_scale_ptr,
+            output_ptr,
+            max_active_clusters,
+            cuda_stream,
+        )
+    else:
+        compiled = cutex.compile(
+            kernel_fn,
+            x_ptr,
+            weight_ptr,
+            x_scale_ptr,
+            weight_scale_ptr,
+            output_ptr,
+            cuda_stream,
+        )
     compile_seconds = time.perf_counter() - compile_started
 
     def te_fprop():
@@ -390,7 +452,13 @@ def run_dense_gemm_remote(
     flop_count = dense_gemm_flops(m, n, k)
     trace_metadata = disabled_iket_metadata()
     if trace:
-        trace_cluster = (32, 32, 0) if is_manual_pipeline else None
+        trace_cluster = None
+        if is_manual_pipeline:
+            trace_cluster = (
+                (0, 0, 0)
+                if implementation == "manual_pipeline_v12"
+                else (32, 32, 0)
+            )
         iket_result = run_iket_profile(
             remote_run_dir / "iket",
             [
@@ -444,6 +512,7 @@ def run_dense_gemm_remote(
             "transformer_engine": {
                 **te_stats.to_dict(include_samples=False),
                 "tflops": flop_count / te_stats.median_us / 1e6,
+                "backend": "cuBLASLt via Transformer Engine general_gemm",
             },
         },
         "compilation": {

@@ -61,6 +61,7 @@ def _run_dense_gemm(
 ) -> dict:
     import cutlass
     import cutlass.cute as cute
+    import cutlass.utils as cutlass_utils
     import torch
     import transformer_engine.pytorch as te
     import transformer_engine_torch as tex
@@ -77,10 +78,13 @@ def _run_dense_gemm(
         from cutex.kernels.dense_gemm_v10 import dense_gemm_v10 as kernel_fn
     elif implementation == "manual_pipeline_v11":
         from cutex.kernels.dense_gemm_v11 import dense_gemm_v11 as kernel_fn
+    elif implementation == "manual_pipeline_v12":
+        from cutex.kernels.dense_gemm_v12 import dense_gemm_v12 as kernel_fn
     else:
         raise ValueError(
             "implementation must be 'tensor_core', 'manual_pipeline_v9', "
-            "'manual_pipeline_v10', or 'manual_pipeline_v11'"
+            "'manual_pipeline_v10', 'manual_pipeline_v11', "
+            "or 'manual_pipeline_v12'"
         )
 
     _require_supported_gpu(torch)
@@ -128,9 +132,26 @@ def _run_dense_gemm(
     )
     torch_stream = torch.cuda.current_stream()
     cuda_stream = cuda.CUstream(torch_stream.cuda_stream)
-    compiled = cute.compile(
-        kernel_fn, a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr, cuda_stream
-    )
+    if implementation == "manual_pipeline_v12":
+        max_active_clusters = cutlass_utils.HardwareInfo().get_max_active_clusters(
+            2, stream=cuda_stream
+        )
+        if max_active_clusters < 1:
+            raise RuntimeError("CUDA reported no active 2-CTA clusters")
+        compiled = cute.compile(
+            kernel_fn,
+            a_ptr,
+            b_ptr,
+            sfa_ptr,
+            sfb_ptr,
+            c_ptr,
+            max_active_clusters,
+            cuda_stream,
+        )
+    else:
+        compiled = cute.compile(
+            kernel_fn, a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr, cuda_stream
+        )
     compiled(a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr, cuda_stream)
     torch.cuda.synchronize()
     return {
@@ -139,6 +160,7 @@ def _run_dense_gemm(
             "manual_pipeline_v9": "dense_gemm_v9",
             "manual_pipeline_v10": "dense_gemm_v10",
             "manual_pipeline_v11": "dense_gemm_v11",
+            "manual_pipeline_v12": "dense_gemm_v12",
         }[implementation],
         "implementation": implementation,
         "shape": {"m": m, "n": n, "k": k},
@@ -167,6 +189,7 @@ def main(argv: list[str] | None = None) -> int:
             "manual_pipeline_v9",
             "manual_pipeline_v10",
             "manual_pipeline_v11",
+            "manual_pipeline_v12",
         ),
         default="tensor_core",
     )

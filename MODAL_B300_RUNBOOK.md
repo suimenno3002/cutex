@@ -2,12 +2,12 @@
 
 本文记录从本地仓库出发，经 Modal 构建远端镜像、申请单张 B300、编译并验证 CuTeDSL kernel、回收结果和停止异常任务的完整流程。
 
-适用快照：2026-08-26。本文以仓库当前的 `modal_dense_gemm.py` 和 Modal `1.5.4` 为准。
+适用快照：2026-09-07。本文以仓库当前的 `modal_dense_gemm.py` 和 Modal `1.5.4` 为准。
 
 ## 验证边界
 
-- 当前可运行路径包括默认 `tensor_core` 和手写调度的 `manual_pipeline_v9/v10/v11`；默认实现仍是稳定主路径，后三者用于 2SM pipeline 对照和性能实验。
-- v9 保留四级 ring 与行主序 grid；v10 是六级 ring 加 Morton swizzle；v11 冻结六级流水，只改用 CuTe layout 的 `8×8` cluster block swizzle。
+- 当前可运行路径包括默认 `tensor_core` 和手写调度的 `manual_pipeline_v9/v10/v11/v12`；默认实现仍是稳定主路径，后四者用于 2SM pipeline 对照和性能实验。
+- v9 保留四级 ring 与行主序 grid；v10 是六级 ring 加 Morton swizzle；v11 冻结六级流水，只改用 CuTe layout 的 `8×8` cluster block swizzle；v12 保持 v11 的 tile/ring/swizzle，按 CUDA cluster occupancy 发射静态 persistent grid（此前 B300 记录值为 74 个 cluster）并重叠 MMA 与 epilogue。
 - `tma_cuda_core_v2` 曾完成过一次 16384³ smoke test；2026-08-24 最近一次含 layout 日志的复测在首个 kernel launch 后长期占满 GPU，未返回正确性或计时结果。当前应把它视为待排查回归，而不是稳定入口。
 - 本地测试或 JIT 编译日志不等于 B300 成功。只有远端结果同时给出 B300/SM103、`status: PASS`、正确性数据和非零计时，才算端到端跑通。
 
@@ -183,6 +183,7 @@ Windows PowerShell 也可使用仓库脚本：
 | `manual_pipeline_v9` | 原始 2SM、手写 mbarrier、warp-specialized Tensor Core 实现 | 四级 ring + 行主序 grid，非 persistent |
 | `manual_pipeline_v10` | 从修改后 v9 独立出的后继实现 | 六级 ring + Z-order cluster tile，非 persistent |
 | `manual_pipeline_v11` | CuTe layout thread-block swizzle 对照 | 六级 ring + `8×8` cluster block swizzle，非 persistent |
+| `manual_pipeline_v12` | v11 的 persistent 后继版本 | occupancy-sized 常驻 2-CTA grid + 原生静态调度 + overlapping accumulator；等待 B300 实测闭环 |
 
 如需复核 v1，只使用最小口径：
 
@@ -224,7 +225,7 @@ uv run modal volume get cutex-autotune-cache \
 
 - `--dump-ir` 将 CuTeDSL dump/PTX 保存在该次远端 run 目录的 `cute-dsl-dump/`，需要通过 Volume 取回。
 - `--trace` 会在普通 benchmark 完成后额外运行一次完整 16384³ IKET 采集，成本和产物都更大；第一次 smoke 和普通 TFLOPS 测试不要启用。
-- `cutex/iket_worker.py` 会按 `--implementation` 选择 `tensor_core` 或 `manual_pipeline_v9/v10/v11`。v9-v11 的 trace 由中部 cluster `(32,32,0)` 写 ranges，三者都把每 warp event buffer 提高到 2048；v1/v2 仍不支持 `--trace`。
+- `cutex/iket_worker.py` 会按 `--implementation` 选择 `tensor_core` 或 `manual_pipeline_v9/v10/v11/v12`。v9-v11 的 trace 由中部 cluster `(32,32,0)` 写 ranges；v12 改由常驻物理 cluster `(0,0,0)` 记录多个 work tile。四者都把每 warp event buffer 提高到 2048；v1/v2 仍不支持 `--trace`。
 
 ## 9. 观察和停止异常任务
 
