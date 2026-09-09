@@ -2,12 +2,12 @@
 
 本文记录从本地仓库出发，经 Modal 构建远端镜像、申请单张 B300、编译并验证 CuTeDSL kernel、回收结果和停止异常任务的完整流程。
 
-适用快照：2026-09-07。本文以仓库当前的 `modal_dense_gemm.py` 和 Modal `1.5.4` 为准。
+适用快照：2026-09-09。本文以仓库当前的 `modal_dense_gemm.py` 和 Modal `1.5.4` 为准。
 
 ## 验证边界
 
-- 当前可运行路径包括默认 `tensor_core` 和手写调度的 `manual_pipeline_v9/v10/v11/v12`；默认实现仍是稳定主路径，后四者用于 2SM pipeline 对照和性能实验。
-- v9 保留四级 ring 与行主序 grid；v10 是六级 ring 加 Morton swizzle；v11 冻结六级流水，只改用 CuTe layout 的 `8×8` cluster block swizzle；v12 保持 v11 的 tile/ring/swizzle，按 CUDA cluster occupancy 发射静态 persistent grid（此前 B300 记录值为 74 个 cluster）并重叠 MMA 与 epilogue。
+- 当前可运行路径包括默认 `tensor_core` 和手写调度的 `manual_pipeline_v9/v10/v11/v12/v13`；v13 是已通过 1000 对正式样本的优化路径，其余版本保留作对照。
+- v9 保留四级 ring 与行主序 grid；v10 是六级 ring 加 Morton swizzle；v11 冻结六级流水，只改用 CuTe layout 的 `8×8` cluster block swizzle；v12 保持 v11 的 tile/ring/swizzle，按 CUDA cluster occupancy 发射静态 persistent grid（此前 B300 记录值为 74 个 cluster）并重叠 MMA 与 epilogue；v13 改用 CLC dynamic persistent 调度和 8-cluster swizzle，在同一常驻 cohort 中动态领取 tile。
 - `tma_cuda_core_v2` 曾完成过一次 16384³ smoke test；2026-08-24 最近一次含 layout 日志的复测在首个 kernel launch 后长期占满 GPU，未返回正确性或计时结果。当前应把它视为待排查回归，而不是稳定入口。
 - 本地测试或 JIT 编译日志不等于 B300 成功。只有远端结果同时给出 B300/SM103、`status: PASS`、正确性数据和非零计时，才算端到端跑通。
 
@@ -150,7 +150,7 @@ smoke test 通过后，再使用仓库历史基线相同的持续测量口径：
 
 ```bash
 uv run modal run modal_dense_gemm.py \
-  --implementation tensor_core \
+  --implementation manual_pipeline_v13 \
   --m 16384 --n 16384 --k 16384 \
   --gpu-warmup-seconds 10 --warmup 200 --iterations 1000
 ```
@@ -183,7 +183,8 @@ Windows PowerShell 也可使用仓库脚本：
 | `manual_pipeline_v9` | 原始 2SM、手写 mbarrier、warp-specialized Tensor Core 实现 | 四级 ring + 行主序 grid，非 persistent |
 | `manual_pipeline_v10` | 从修改后 v9 独立出的后继实现 | 六级 ring + Z-order cluster tile，非 persistent |
 | `manual_pipeline_v11` | CuTe layout thread-block swizzle 对照 | 六级 ring + `8×8` cluster block swizzle，非 persistent |
-| `manual_pipeline_v12` | v11 的 persistent 后继版本 | occupancy-sized 常驻 2-CTA grid + 原生静态调度 + overlapping accumulator；等待 B300 实测闭环 |
+| `manual_pipeline_v12` | v11 的 persistent 后继版本 | occupancy-sized 常驻 2-CTA grid + 原生静态调度 + overlapping accumulator；B300 正确性和三轮性能已验证，当前未快于 v11 |
+| `manual_pipeline_v13` | CLC dynamic persistent 优化版本 | 224 threads/CTA、六级连续 ring、双 completion barrier、128×64 early-release epilogue、M-major 8-cluster swizzle；B300 当前源码 1000 对正式样本效率中位 `100.229%` |
 
 如需复核 v1，只使用最小口径：
 
@@ -225,7 +226,7 @@ uv run modal volume get cutex-autotune-cache \
 
 - `--dump-ir` 将 CuTeDSL dump/PTX 保存在该次远端 run 目录的 `cute-dsl-dump/`，需要通过 Volume 取回。
 - `--trace` 会在普通 benchmark 完成后额外运行一次完整 16384³ IKET 采集，成本和产物都更大；第一次 smoke 和普通 TFLOPS 测试不要启用。
-- `cutex/iket_worker.py` 会按 `--implementation` 选择 `tensor_core` 或 `manual_pipeline_v9/v10/v11/v12`。v9-v11 的 trace 由中部 cluster `(32,32,0)` 写 ranges；v12 改由常驻物理 cluster `(0,0,0)` 记录多个 work tile。四者都把每 warp event buffer 提高到 2048；v1/v2 仍不支持 `--trace`。
+- `cutex/iket_worker.py` 会按 `--implementation` 选择 `tensor_core` 或 `manual_pipeline_v9/v10/v11/v12/v13`。v9-v11 的 trace 由中部 cluster `(32,32,0)` 写 ranges；v12/v13 改由常驻物理 cluster `(0,0,0)` 记录多个 work tile。v12/v13 的 persistent trace 将每 warp event buffer 提高到 65536；v1/v2 仍不支持 `--trace`。
 
 ## 9. 观察和停止异常任务
 
@@ -278,6 +279,8 @@ uv run modal app stop <app-id>
 - 低成本预检入口：[`modal_app.py`](modal_app.py)
 - 固定 shape/精度合同：[`cutex/kernels/dense_gemm_contract.py`](cutex/kernels/dense_gemm_contract.py)
 - v1 历史验证：[`benchmarks/B300_DENSE_GEMM_V1_CUDA_CORE.md`](benchmarks/B300_DENSE_GEMM_V1_CUDA_CORE.md)
+- v11/v12 persistent 对比：[`benchmarks/B300_DENSE_GEMM_V11_V12_PERSISTENT_COMPARISON_20260908.md`](benchmarks/B300_DENSE_GEMM_V11_V12_PERSISTENT_COMPARISON_20260908.md)
+- v13/CuBLASLt 优化与正式验收：[`benchmarks/B300_DENSE_GEMM_V13_CUBLAS_COMPARISON_20260909.md`](benchmarks/B300_DENSE_GEMM_V13_CUBLAS_COMPARISON_20260909.md)
 - 现有主说明和 B300 基线：[`README.md`](README.md)
 - [Modal 入门与认证](https://modal.com/docs/guide)
 - [Modal GPU/B300 说明](https://modal.com/docs/guide/gpu)

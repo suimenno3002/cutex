@@ -31,6 +31,7 @@ cutex/
 │       ├── dense_gemm_v10.py # 六级 ring + Z-order 的 v9 后继版本
 │       ├── dense_gemm_v11.py # 六级 ring + CuTe 8×8 cluster block swizzle
 │       ├── dense_gemm_v12.py # occupancy-sized persistent grid + overlapping accumulator
+│       ├── dense_gemm_v13.py # CLC dynamic persistent + 8-cluster swizzle
 │       └── dense_gemm_contract.py # shape、精度与 scale 布局合同
 ├── modal_app.py             # Modal image、GPU function、本地入口
 ├── modal_dense_gemm.py      # 固定 B300 MXFP8 GEMM 验证与 benchmark 入口
@@ -171,10 +172,15 @@ MMA: FP8 E4M3FN × E4M3FN，单一 FP32 TMEM accumulator
 
 正式 kernel 只接受 `M=N=K=16384`，固定使用 `128 × 256 × 128` CTA tile、四级 A/B/scale TMA pipeline、SM103 `tcgen05` block-scaled MMA 和 128 threads。量化与 scale swizzle 在计时区外；没有 fast accumulation 或 split-K。`dense_gemm_v0.py` 保留同一 pointer 接口的纯 TODO 骨架；`dense_gemm_v1.py` 实现 16 × 16 × 16 shared-memory 分块、手工 MXFP8 反量化和标量 FP32 CUDA Core 累加；`dense_gemm_v2.py` 则按 K tile 严格串行执行四路 TMA、手写 mbarrier 等待、标量 FP32 CUDA Core 累加与 BF16 写回，不创建 `PipelineTmaAsync`、MMA 或 Tensor Core 对象。v1/v2 都用于教学与正确性对照，不以性能为目标。
 
-`dense_gemm_v9.py` 保留原始手写异步流水实现：固定 `CtaGroup.TWO`、`(2,1,1)` cluster、pair-wide `256 × 256 × 128` tile、四级 A/B/scale 环形缓冲、常规行主序 grid 和 `4 epilogue + 1 MMA + 1 TMA` warp 特化。`dense_gemm_v10.py` 从此前工作区中修改后的 v9 独立出来，在其余计算与同步路径不变的前提下使用六级 ring，并以 Z-order（Morton）重映射 cluster tile。`dense_gemm_v11.py` 冻结 v10 的流水参数，只把 Morton 解码替换为 CuTe layout 表达的 `8×8` cluster block swizzle，仍是 non-persistent。`dense_gemm_v12.py` 保持 v11 的数学 tile、六级 A/B/SF ring 和 8×8 swizzle，改用原生 `StaticPersistentTileScheduler`：按 CUDA 运行时返回的 cluster occupancy 发射常驻 2-CTA cluster（此前 B300 记录值为 74），每个处理 55 或 56 个 output tile；barrier/TMEM prologue 只执行一次，并用两份错位重叠的 accumulator view 将下一 tile 的 MMA 与当前 tile 的寄存器转换和 GMEM store 重叠。四个版本分别通过 `manual_pipeline_v9/v10/v11/v12` 选择，也都支持单 cluster IKET ranges。
+`dense_gemm_v9.py` 保留原始手写异步流水实现：固定 `CtaGroup.TWO`、`(2,1,1)` cluster、pair-wide `256 × 256 × 128` tile、四级 A/B/scale 环形缓冲、常规行主序 grid 和 `4 epilogue + 1 MMA + 1 TMA` warp 特化。`dense_gemm_v10.py` 从此前工作区中修改后的 v9 独立出来，在其余计算与同步路径不变的前提下使用六级 ring，并以 Z-order（Morton）重映射 cluster tile。`dense_gemm_v11.py` 冻结 v10 的流水参数，只把 Morton 解码替换为 CuTe layout 表达的 `8×8` cluster block swizzle，仍是 non-persistent。`dense_gemm_v12.py` 保持 v11 的数学 tile、六级 A/B/SF ring 和 8×8 swizzle，改用原生 `StaticPersistentTileScheduler`：按 CUDA 运行时返回的 cluster occupancy 发射常驻 2-CTA cluster（此前 B300 记录值为 74），每个处理 55 或 56 个 output tile；barrier/TMEM prologue 只执行一次，并用两份错位重叠的 accumulator view 将下一 tile 的 MMA 与当前 tile 的寄存器转换和 GMEM store 重叠。`dense_gemm_v13.py` 进一步换成 CLC dynamic persistent scheduler，增加独立 scheduler warp，以逻辑 `(128,64,1)` grid 让硬件取消未驻留 cluster，并由 74 个常驻 cluster 动态领取 4096 个 output tile；最终采用 M-major、8-cluster swizzle、六级连续 ring、两份 completion barrier 和 128×64 early-release epilogue。五个版本分别通过 `manual_pipeline_v9/v10/v11/v12/v13` 选择，也都支持单 cluster IKET ranges。
+
+2026-09-08 已在 B300 上完成 v12 的完整 `16384³` 正确性和三轮持续性能验证。v11/v12 的跨运行中位数分别为 `3562.416 us / 2469.137 TFLOP/s` 与 `3619.824 us / 2429.978 TFLOP/s`，达到同轮 cuBLASLt MXFP8 基线的 `95.044%` 与 `92.812%`。v12 的 persistent 数据流成立，但当前版本没有取得净性能收益，暂不替换 v11；设计边界、六轮原始结果和复现命令见 [`benchmarks/B300_DENSE_GEMM_V11_V12_PERSISTENT_COMPARISON_20260908.md`](benchmarks/B300_DENSE_GEMM_V11_V12_PERSISTENT_COMPARISON_20260908.md)。
+
+2026-09-09 已在 B300 上完成 v13 的最终验收。当前源码按 `10 s GPU warmup + 200 warmup + 1000` 对交替顺序 CUDA-event 样本测得 `3244.848 us / 2710.787 TFLOP/s`，同轮 cuBLASLt 为 `3252.000 us / 2704.826 TFLOP/s`；逐对效率中位数 `100.229%`、均值 `100.232%`，其中 `766/1000` 对 v13 更快。另一轮 1000 对以及三轮各 200 对也全部超过 100%；五轮合计 2600 对的效率中位数为 `100.220%`、均值为 `100.225%`，`2003/2600` 对 v13 更快。v13 与 cuBLASLt 的 BF16 输出逐元素一致。实现、试验淘汰记录、同口径 v11/v12 对照和原始 artifact 见 [`benchmarks/B300_DENSE_GEMM_V13_CUBLAS_COMPARISON_20260909.md`](benchmarks/B300_DENSE_GEMM_V13_CUBLAS_COMPARISON_20260909.md)。
 
 ```powershell
 uv run modal run modal_dense_gemm.py --m 16384 --n 16384 --k 16384 `
+  --implementation manual_pipeline_v13 `
   --gpu-warmup-seconds 10 --warmup 200 --iterations 1000
 ```
 
@@ -185,7 +191,7 @@ uv run modal run modal_dense_gemm.py --m 16384 --n 16384 --k 16384 `
   -GpuWarmupSeconds 10 -Warmup 200 -Iterations 1000
 ```
 
-远端使用 Transformer Engine 只物化 rowwise MXFP8 数据和 GEMM-swizzled scales，再编译 CuTeDSL kernel。正确性同时对齐原始 BF16 输入的 FP32 `torch.mm` 与 TE Fprop；CUDA Events 分别测 custom kernel 和 TE，量化不进入计时。`result.json` 与可选 IKET 产物保存到本地 `artifacts/<run-id>-dense_gemm_mxfp8_16384/` 和 Modal Volume。加 `--trace`（脚本使用 `-Trace`）采集 kernel 内部阶段；加 `--dump-ir`（脚本使用 `-DumpIr`）可保留 IR/PTX。
+远端使用 Transformer Engine 只物化 rowwise MXFP8 数据和 GEMM-swizzled scales，再编译 CuTeDSL kernel。正确性同时对齐原始 BF16 输入的 FP32 `torch.mm` 与 TE Fprop；CUDA Events 在每个样本对内交替 launch 顺序，分别测 custom kernel 和 TE，量化不进入计时。`result.json` 与可选 IKET 产物保存到本地 `artifacts/<run-id>-dense_gemm_mxfp8_16384/` 和 Modal Volume。加 `--trace`（脚本使用 `-Trace`）采集 kernel 内部阶段；加 `--dump-ir`（脚本使用 `-DumpIr`）可保留 IR/PTX/SASS。
 
 ### 已验证 dense GEMM 基线（2026-08-22）
 

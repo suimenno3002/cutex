@@ -45,6 +45,10 @@ def run_dense_gemm_remote(
     gpu_warmup_seconds: float = 10.0,
     trace: bool = False,
     dump_ir: bool = False,
+    profile_kernels: bool = False,
+    persistent_waves: int = 1,
+    persistent_clusters: int = 0,
+    compile_options: str = "",
     implementation: str = "tensor_core",
 ) -> dict:
     import importlib.metadata
@@ -63,7 +67,7 @@ def run_dense_gemm_remote(
     from transformer_engine.pytorch.cpp_extensions import general_gemm
 
     import cutex
-    from cutex.benchmark import cuda_benchmark
+    from cutex.benchmark import cuda_benchmark_pair, paired_comparison
     from cutex.kernels.dense_gemm_contract import (
         MMA_SHAPE,
         SCALE_FACTOR_ELEMENTS,
@@ -221,11 +225,52 @@ def run_dense_gemm_remote(
             "rasterization": "native static persistent 8x8 cluster swizzle",
             "synchronization": "persistent manual mbarriers with early accumulator release",
         }
+        persistent_cluster_shape = V12_CLUSTER_SHAPE
+        persistent_mma_tile = V12_MMA_TILE
+    elif implementation == "manual_pipeline_v13":
+        from cutex.kernels.dense_gemm_v13 import (
+            AB_STAGES as V13_AB_STAGES,
+            ACC_FULL_STAGES as V13_ACC_FULL_STAGES,
+            ACC_PHYSICAL_STAGES as V13_ACC_PHYSICAL_STAGES,
+            CLUSTER_SHAPE as V13_CLUSTER_SHAPE,
+            CLUSTER_SWIZZLE_SIZE as V13_CLUSTER_SWIZZLE_SIZE,
+            CTA_TILE as V13_CTA_TILE,
+            MMA_INSTRUCTION as V13_MMA_INSTRUCTION,
+            MMA_TILE as V13_MMA_TILE,
+            THREADS as V13_THREADS,
+            dense_gemm_v13 as kernel_fn,
+        )
+
+        kernel_name = f"{KERNEL_BASE_NAME}_manual_pipeline_v13"
+        kernel_config = {
+            "implementation": implementation,
+            "arithmetic": "SM103 2CTA tcgen05 block-scaled tensor core",
+            "mma_instruction": list(V13_MMA_INSTRUCTION),
+            "tile": list(V13_MMA_TILE),
+            "threads_per_cta": V13_THREADS,
+            "cluster": list(V13_CLUSTER_SHAPE),
+            "ab_stages": V13_AB_STAGES,
+            "physical_accumulator_views": V13_ACC_PHYSICAL_STAGES,
+            "accumulator_full_barriers": V13_ACC_FULL_STAGES,
+            "cluster_swizzle_size": V13_CLUSTER_SWIZZLE_SIZE,
+            "scheduler": "CLC dynamic persistent",
+            "rasterization": (
+                f"M-major, cluster swizzle {V13_CLUSTER_SWIZZLE_SIZE}"
+            ),
+            "synchronization": (
+                "six-stage manual A/B/SF ring; two completion barriers; "
+                "early accumulator release"
+            ),
+            "optimization": "128-K TMA tiles with a six-stage ring",
+        }
+        persistent_cluster_shape = V13_CLUSTER_SHAPE
+        persistent_mma_tile = V13_MMA_TILE
     else:
         raise ValueError(
             "implementation must be 'tensor_core', 'tma_cuda_core_v2', "
             "'cuda_core_v1', 'manual_pipeline_v9', 'manual_pipeline_v10', "
-            "'manual_pipeline_v11', or 'manual_pipeline_v12'"
+            "'manual_pipeline_v11', 'manual_pipeline_v12', or "
+            "'manual_pipeline_v13'"
         )
     if trace and implementation not in {
         "tensor_core",
@@ -233,6 +278,7 @@ def run_dense_gemm_remote(
         "manual_pipeline_v10",
         "manual_pipeline_v11",
         "manual_pipeline_v12",
+        "manual_pipeline_v13",
     }:
         raise ValueError(f"IKET worker is not wired for {implementation}")
     is_manual_pipeline = implementation in {
@@ -240,10 +286,19 @@ def run_dense_gemm_remote(
         "manual_pipeline_v10",
         "manual_pipeline_v11",
         "manual_pipeline_v12",
+        "manual_pipeline_v13",
     }
-    if warmup < 0 or iterations < 1 or gpu_warmup_seconds < 0:
+    if (
+        warmup < 0
+        or iterations < 1
+        or gpu_warmup_seconds < 0
+        or persistent_waves < 1
+        or persistent_clusters < 0
+    ):
         raise ValueError(
-            "warmup must be >= 0, iterations must be >= 1, and GPU warmup must be >= 0"
+            "warmup must be >= 0, iterations must be >= 1, GPU warmup must be "
+            ">= 0, persistent_waves must be >= 1, and persistent_clusters must "
+            "be >= 0"
         )
     if not torch.cuda.is_available():
         raise RuntimeError("Modal did not attach a CUDA-capable GPU")
@@ -275,8 +330,9 @@ def run_dense_gemm_remote(
         os.environ.update(
             {
                 "CUTE_DSL_DUMP_DIR": str(dump_dir),
+                "CUTE_DSL_KEEP": "ir,ptx,cubin,sass",
                 "CUTE_DSL_KEEP_PTX": "1",
-                "CUTE_DSL_LINEINFO": "1",
+                "CUTE_DSL_LINEINFO": "0",
             }
         )
 
@@ -330,7 +386,7 @@ def run_dense_gemm_remote(
         sf8,
         x_q._rowwise_scale_inv.data_ptr(),
         cute.AddressSpace.gmem,
-        assumed_align=32,
+        assumed_align=16,
     )
     weight_scale_ptr = make_ptr(
         sf8,
@@ -344,34 +400,84 @@ def run_dense_gemm_remote(
         cutlass.BFloat16,
         output.data_ptr(),
         cute.AddressSpace.gmem,
-        assumed_align=16,
+        assumed_align=32,
     )
     torch_stream = torch.cuda.current_stream()
     cuda_stream = cuda.CUstream(torch_stream.cuda_stream)
 
+    effective_compile_options = compile_options
+    if implementation == "manual_pipeline_v13" and not effective_compile_options:
+        effective_compile_options = "--opt-level 1"
     compile_started = time.perf_counter()
-    if implementation == "manual_pipeline_v12":
-        max_active_clusters = cutlass_utils.HardwareInfo().get_max_active_clusters(
-            V12_CLUSTER_SHAPE[0] * V12_CLUSTER_SHAPE[1],
-            stream=cuda_stream,
+    compile_kwargs = (
+        {"options": effective_compile_options}
+        if effective_compile_options
+        else {}
+    )
+    if implementation in {"manual_pipeline_v12", "manual_pipeline_v13"}:
+        hardware_max_active_clusters = (
+            cutlass_utils.HardwareInfo().get_max_active_clusters(
+                persistent_cluster_shape[0] * persistent_cluster_shape[1],
+                stream=cuda_stream,
+            )
         )
-        if max_active_clusters < 1:
+        if hardware_max_active_clusters < 1:
             raise RuntimeError("CUDA reported no active 2-CTA clusters")
-        logical_output_clusters = (m // V12_MMA_TILE[0]) * (
-            n // V12_MMA_TILE[1]
+        logical_output_clusters = (
+            m
+            // (
+                persistent_mma_tile[0]
+                * persistent_cluster_shape[0]
+                // 2
+            )
+        ) * (
+            n // (persistent_mma_tile[1] * persistent_cluster_shape[1])
         )
-        kernel_config["max_active_clusters"] = max_active_clusters
-        kernel_config["persistent_grid"] = [
-            V12_CLUSTER_SHAPE[0],
-            V12_CLUSTER_SHAPE[1],
-            max_active_clusters,
-        ]
+        if implementation == "manual_pipeline_v12":
+            requested_clusters = (
+                persistent_clusters
+                if persistent_clusters
+                else hardware_max_active_clusters * persistent_waves
+            )
+            max_active_clusters = min(logical_output_clusters, requested_clusters)
+            if max_active_clusters < 1:
+                raise RuntimeError("persistent launch requires at least one cluster")
+            kernel_config["persistent_waves"] = persistent_waves
+            kernel_config["persistent_clusters_override"] = persistent_clusters
+            kernel_config["launch_clusters"] = max_active_clusters
+            kernel_config["persistent_grid"] = [
+                persistent_cluster_shape[0],
+                persistent_cluster_shape[1],
+                max_active_clusters,
+            ]
+            kernel_config["work_tiles_per_cluster"] = [
+                logical_output_clusters // max_active_clusters,
+                (logical_output_clusters + max_active_clusters - 1)
+                // max_active_clusters,
+            ]
+        else:
+            # The CLC scheduler launches every logical CTA and relies on
+            # hardware cancellation; the occupancy query describes the active
+            # cohort, not the launch grid.  Keep the constexpr argument only to
+            # preserve the v12-compatible JIT calling convention.
+            max_active_clusters = hardware_max_active_clusters
+            logical_launch_grid = [
+                m // V13_CTA_TILE[0],
+                n // V13_CTA_TILE[1],
+                1,
+            ]
+            kernel_config["logical_launch_grid"] = logical_launch_grid
+            kernel_config["logical_launch_ctas"] = (
+                logical_launch_grid[0] * logical_launch_grid[1]
+            )
+            kernel_config["resident_clusters"] = hardware_max_active_clusters
+            kernel_config["work_tiles_per_resident_cluster"] = [
+                logical_output_clusters // hardware_max_active_clusters,
+                (logical_output_clusters + hardware_max_active_clusters - 1)
+                // hardware_max_active_clusters,
+            ]
+        kernel_config["hardware_max_active_clusters"] = hardware_max_active_clusters
         kernel_config["logical_output_clusters"] = logical_output_clusters
-        kernel_config["work_tiles_per_cluster"] = [
-            logical_output_clusters // max_active_clusters,
-            (logical_output_clusters + max_active_clusters - 1)
-            // max_active_clusters,
-        ]
         compiled = cutex.compile(
             kernel_fn,
             x_ptr,
@@ -381,6 +487,7 @@ def run_dense_gemm_remote(
             output_ptr,
             max_active_clusters,
             cuda_stream,
+            **compile_kwargs,
         )
     else:
         compiled = cutex.compile(
@@ -391,8 +498,36 @@ def run_dense_gemm_remote(
             weight_scale_ptr,
             output_ptr,
             cuda_stream,
+            **compile_kwargs,
         )
     compile_seconds = time.perf_counter() - compile_started
+    compiler_artifacts = []
+    if dump_ir:
+        dump_dir = remote_run_dir / "cute-dsl-dump"
+        artifact_stem = _safe_segment(kernel_name)
+        for attribute, suffix in (
+            ("__mlir__", "mlir"),
+            ("__ptx__", "ptx"),
+            ("__cubin__", "cubin"),
+            ("__sass__", "sass"),
+        ):
+            payload = getattr(compiled, attribute, None)
+            if payload is None:
+                continue
+            filename = f"{artifact_stem}.{suffix}"
+            destination = dump_dir / filename
+            if isinstance(payload, bytes):
+                destination.write_bytes(payload)
+            else:
+                destination.write_text(str(payload), encoding="utf-8")
+            compiler_artifacts.append(
+                {
+                    "kind": destination.suffix.lstrip("."),
+                    "relative_path": f"compiler/{destination.name}",
+                    "volume_path": destination.relative_to(CACHE_MOUNT).as_posix(),
+                    "size_bytes": destination.stat().st_size,
+                }
+            )
 
     def te_fprop():
         general_gemm(
@@ -434,21 +569,73 @@ def run_dense_gemm_remote(
             f"MXFP8 correctness failed: relative_l2={custom_relative_l2}"
         )
 
-    kernel_stats = cuda_benchmark(
-        compiled,
-        x_ptr,
-        weight_ptr,
-        x_scale_ptr,
-        weight_scale_ptr,
-        output_ptr,
-        cuda_stream,
+    profiler_metadata = {"enabled": False, "cuda_events": []}
+    if profile_kernels:
+        from torch.profiler import ProfilerActivity, profile
+
+        torch.cuda.synchronize()
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            record_shapes=False,
+        ) as torch_profile:
+            compiled(
+                x_ptr,
+                weight_ptr,
+                x_scale_ptr,
+                weight_scale_ptr,
+                output_ptr,
+                cuda_stream,
+            )
+            te_fprop()
+            torch.cuda.synchronize()
+        cuda_events = []
+        for event in torch_profile.events():
+            if "cuda" not in str(event.device_type).lower():
+                continue
+            cuda_events.append(
+                {
+                    "name": str(event.name),
+                    "device_time_us": float(
+                        getattr(event, "device_time_total", 0.0)
+                    ),
+                }
+            )
+        chrome_trace_path = remote_run_dir / "torch-profiler.json"
+        torch_profile.export_chrome_trace(str(chrome_trace_path))
+        chrome_trace = json.loads(chrome_trace_path.read_text(encoding="utf-8"))
+        kernel_launches = [
+            {
+                "name": str(event.get("name", "")),
+                "duration_us": float(event.get("dur", 0.0)),
+                "arguments": dict(event.get("args", {})),
+            }
+            for event in chrome_trace.get("traceEvents", [])
+            if str(event.get("cat", "")).lower() == "kernel"
+        ]
+        profiler_metadata = {
+            "enabled": True,
+            "cuda_events": cuda_events,
+            "kernel_launches": kernel_launches,
+        }
+
+    def custom_fprop():
+        compiled(
+            x_ptr,
+            weight_ptr,
+            x_scale_ptr,
+            weight_scale_ptr,
+            output_ptr,
+            cuda_stream,
+        )
+
+    kernel_stats, te_stats = cuda_benchmark_pair(
+        custom_fprop,
+        te_fprop,
         warmup=warmup,
         rep=iterations,
         stream=torch_stream,
     )
-    te_stats = cuda_benchmark(
-        te_fprop, warmup=warmup, rep=iterations, stream=torch_stream
-    )
+    paired_stats = paired_comparison(kernel_stats, te_stats)
     flop_count = dense_gemm_flops(m, n, k)
     trace_metadata = disabled_iket_metadata()
     if trace:
@@ -456,7 +643,7 @@ def run_dense_gemm_remote(
         if is_manual_pipeline:
             trace_cluster = (
                 (0, 0, 0)
-                if implementation == "manual_pipeline_v12"
+                if implementation in {"manual_pipeline_v12", "manual_pipeline_v13"}
                 else (32, 32, 0)
             )
         iket_result = run_iket_profile(
@@ -473,7 +660,11 @@ def run_dense_gemm_remote(
                 implementation,
             ],
             instrumented_cluster=trace_cluster,
-            max_ts_cnt_per_warp=2048 if is_manual_pipeline else None,
+            max_ts_cnt_per_warp=(
+                65536
+                if implementation in {"manual_pipeline_v12", "manual_pipeline_v13"}
+                else 2048 if is_manual_pipeline else None
+            ),
         )
         trace_metadata = iket_result.to_metadata(volume_root=CACHE_MOUNT)
         trace_metadata["workload_shape"] = {"m": m, "n": n, "k": k}
@@ -501,16 +692,18 @@ def run_dense_gemm_remote(
         },
         "benchmark": {
             "timer": "CUDA events",
+            "sampling": "paired samples with alternating launch order",
             "gpu_warmup_seconds": gpu_warmup_seconds,
             "warmup": warmup,
             "iterations": iterations,
             "flop_count": flop_count,
+            "paired": paired_stats,
             "kernel": {
-                **kernel_stats.to_dict(include_samples=False),
+                **kernel_stats.to_dict(include_samples=True),
                 "tflops": flop_count / kernel_stats.median_us / 1e6,
             },
             "transformer_engine": {
-                **te_stats.to_dict(include_samples=False),
+                **te_stats.to_dict(include_samples=True),
                 "tflops": flop_count / te_stats.median_us / 1e6,
                 "backend": "cuBLASLt via Transformer Engine general_gemm",
             },
@@ -519,6 +712,8 @@ def run_dense_gemm_remote(
             "location": "modal_remote_container",
             "seconds": compile_seconds,
             "dump_ir": dump_ir,
+            "options": effective_compile_options,
+            "files": compiler_artifacts,
         },
         "environment": {
             "gpu_name": str(properties.name),
@@ -537,6 +732,7 @@ def run_dense_gemm_remote(
             "run_directory": str(remote_run_dir),
         },
         "trace": trace_metadata,
+        "profiler": profiler_metadata,
     }
     (remote_run_dir / "result.json").write_text(
         json.dumps(result, indent=2, sort_keys=True), encoding="utf-8"
@@ -555,6 +751,10 @@ def main(
     gpu_warmup_seconds: float = 10.0,
     trace: bool = False,
     dump_ir: bool = False,
+    profile_kernels: bool = False,
+    persistent_waves: int = 1,
+    persistent_clusters: int = 0,
+    compile_options: str = "",
     implementation: str = "tensor_core",
 ):
     result = run_dense_gemm_remote.remote(
@@ -566,6 +766,10 @@ def main(
         gpu_warmup_seconds=gpu_warmup_seconds,
         trace=trace,
         dump_ir=dump_ir,
+        profile_kernels=profile_kernels,
+        persistent_waves=persistent_waves,
+        persistent_clusters=persistent_clusters,
+        compile_options=compile_options,
         implementation=implementation,
     )
     run_dir = LOCAL_ARTIFACT_ROOT / f"{result['run_id']}-{result['kernel']}"
@@ -576,6 +780,12 @@ def main(
         cache_volume, result["trace"].get("files", []), run_dir
     )
     result["trace"]["local_files"] = [str(path.resolve()) for path in downloaded]
+    compiler_files = download_iket_artifacts(
+        cache_volume, result["compilation"].get("files", []), run_dir
+    )
+    result["compilation"]["local_files"] = [
+        str(path.resolve()) for path in compiler_files
+    ]
     result_path = run_dir / "result.json"
     result_path.write_text(
         json.dumps(result, indent=2, sort_keys=True), encoding="utf-8"
@@ -589,6 +799,7 @@ def main(
                 "configuration": result["configuration"],
                 "correctness": result["correctness"],
                 "benchmark": result["benchmark"],
+                "profiler": result["profiler"],
                 "trace_files": result["trace"]["local_files"],
                 "local_artifact": str(result_path.resolve()),
             },

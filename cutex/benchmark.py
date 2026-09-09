@@ -82,3 +82,105 @@ def cuda_benchmark(
     samples_us = [start.elapsed_time(end) * 1_000.0 for start, end in pairs]
     return stats_from_samples(samples_us)
 
+
+def cuda_benchmark_pair(
+    first_fn: Callable[[], Any],
+    second_fn: Callable[[], Any],
+    *,
+    warmup: int = 5,
+    rep: int = 30,
+    stream=None,
+) -> tuple[BenchmarkStats, BenchmarkStats]:
+    """Measure two asynchronous launches at matched thermal time points.
+
+    Each sample pair contains one launch of each callable.  Their order flips
+    on every pair so neither implementation systematically runs earlier in the
+    benchmark or immediately after the same predecessor.  CUDA events still
+    delimit each individual launch, excluding Python dispatch overhead.
+    """
+
+    if warmup < 0 or rep < 1:
+        raise ValueError("warmup must be >= 0 and rep must be >= 1")
+
+    import torch
+
+    for warmup_idx in range(warmup):
+        if warmup_idx % 2 == 0:
+            first_fn()
+            second_fn()
+        else:
+            second_fn()
+            first_fn()
+    torch.cuda.synchronize()
+
+    event_pairs: list[list[tuple[Any, Any]]] = [[], []]
+    for sample_idx in range(rep):
+        order = (0, 1) if sample_idx % 2 == 0 else (1, 0)
+        for fn_idx in order:
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            if stream is None:
+                start.record()
+                (first_fn if fn_idx == 0 else second_fn)()
+                end.record()
+            else:
+                start.record(stream)
+                (first_fn if fn_idx == 0 else second_fn)()
+                end.record(stream)
+            event_pairs[fn_idx].append((start, end))
+
+    event_pairs[order[-1]][-1][1].synchronize()
+    first_samples = [
+        start.elapsed_time(end) * 1_000.0 for start, end in event_pairs[0]
+    ]
+    second_samples = [
+        start.elapsed_time(end) * 1_000.0 for start, end in event_pairs[1]
+    ]
+    return stats_from_samples(first_samples), stats_from_samples(second_samples)
+
+
+def paired_comparison(
+    first: BenchmarkStats,
+    second: BenchmarkStats,
+) -> dict[str, Any]:
+    """Summarize aligned sample pairs as latency deltas and efficiency."""
+
+    if len(first.samples_us) != len(second.samples_us):
+        raise ValueError("paired sample counts must match")
+    if not first.samples_us:
+        raise ValueError("at least one sample pair is required")
+    if any(sample <= 0 for sample in first.samples_us):
+        raise ValueError("first samples must be positive")
+
+    deltas = [
+        first_sample - second_sample
+        for first_sample, second_sample in zip(
+            first.samples_us, second.samples_us
+        )
+    ]
+    efficiencies = [
+        100.0 * second_sample / first_sample
+        for first_sample, second_sample in zip(
+            first.samples_us, second.samples_us
+        )
+    ]
+
+    def metric_payload(samples: list[float]) -> dict[str, Any]:
+        stats = stats_from_samples(samples)
+        return {
+            "samples": list(stats.samples_us),
+            "mean": stats.mean_us,
+            "median": stats.median_us,
+            "min": stats.min_us,
+            "max": stats.max_us,
+            "p95": stats.p95_us,
+        }
+
+    first_faster_samples = sum(delta < 0 for delta in deltas)
+    return {
+        "sample_pairs": len(deltas),
+        "delta_us": metric_payload(deltas),
+        "efficiency_pct": metric_payload(efficiencies),
+        "first_faster_samples": first_faster_samples,
+        "first_faster_pct": 100.0 * first_faster_samples / len(deltas),
+    }
